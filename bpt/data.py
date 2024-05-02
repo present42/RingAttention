@@ -12,7 +12,7 @@ from ml_collections import ConfigDict
 from tqdm import tqdm, trange
 import numpy as np
 
-from datasets import load_dataset
+from datasets import _dataset
 
 
 class DatasetFactory(object):

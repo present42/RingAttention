@@ -20,25 +20,52 @@ from typing import Any, NamedTuple
 def _ring_attention_fwd(q, k, v, attn_bias, segment_ids, axis_name, float32_logits, blockwise_kwargs):
     if float32_logits:
         q, k = q.astype(jnp.float32), k.astype(jnp.float32)
+    # (B, S_Q, A, Z)  Q.shape
+    # (B, S_KV, A, Z) K.shape
+    # (B, S_KV, A, Z) V.shape
     batch, q_len, num_heads, dim_per_head = q.shape
     batch, kv_len, num_heads, dim_per_head = k.shape
     numerator = jnp.zeros((batch, q_len, num_heads, dim_per_head)).astype(q.dtype)
     denominator = jnp.zeros((batch, num_heads, q_len)).astype(q.dtype)
+    
+    # total number of blocks across sequence dimension
     axis_size = lax.psum(1, axis_name)
     q_block_size, kv_block_size = q_len, kv_len # assumes this function is pre-sharded inside shard_map
     query_chunk_size = blockwise_kwargs["query_chunk_size"]
     key_chunk_size = blockwise_kwargs["key_chunk_size"]
 
+    # note. jax.lax.scan returns (final_carry, np.stack[ys])
     def scan_kv_block(carry, idx):
+        # function for scan takes   (carry, x) as an argument
+        #               and returns (carry, y)
         prev_max_score, numerator, denominator, k, v = carry
+        
+        # index along sequence-dimension
+        # fixed q_block_idx
         q_block_idx = lax.axis_index(axis_name)
+        # increment k_block_idx by 1 at every step
         k_block_idx = (lax.axis_index(axis_name) - idx) % axis_size
+        
         q_chunk_idx_start = q_block_idx * (q_block_size // query_chunk_size)
         k_chunk_idx_start = k_block_idx * (kv_block_size // key_chunk_size)
+        
         numerator, denominator, max_score = _blockwise_attention_fwd(q, k, v, (numerator, denominator, prev_max_score), q_chunk_idx_start, k_chunk_idx_start, bias=attn_bias, segment_ids=segment_ids, **blockwise_kwargs)
-        k, v = map(lambda x: lax.ppermute(x, axis_name, perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]), (k, v))
+        # send (k, v) pair to the next device and receive (k, v) pair from the previous device
+        k, v = map(lambda x: lax.ppermute(
+                                x, 
+                                axis_name, 
+                                perm=[(i, (i + 1) % axis_size) for i in range(axis_size)]
+                            ), 
+                            (k, v)
+        )
+        
+        # return carry, y (which is irrelevant in this case so that it is set to None)
         return (max_score, numerator, denominator, k, v), None
+    
+    # initial value for maximum score for each query 
     prev_max_score = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(q.dtype)
+    
+    
     (max_score, numerator, denominator, _, _), _ = lax.scan(scan_kv_block,
         init=(prev_max_score, numerator, denominator, k, v), xs=jnp.arange(0, axis_size))
     output = numerator / rearrange(denominator, 'b h q -> b q h')[..., None]
@@ -145,16 +172,26 @@ ring_attention_standard.defvjp(_ring_attention_standard_fwd, _ring_attention_sta
 
 def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_start, bias, segment_ids, causal, query_chunk_size,
                              key_chunk_size, deterministic, dropout_rng, attn_pdrop, dtype, policy, precision, prevent_cse):
+    """ This function is called from lax.scan in _ring_attention_fwd
+        For every iteration, incoming q is fixed but k/v values are changed
+        Here, we can think of q, k, v as small chunks of Q, K, V
+    """
+    # Decompose dimensions
     batch, q_len, num_heads, dim_per_head = q.shape
     batch, kv_len, num_heads, dim_per_head = k.shape
     batch, kv_len, num_heads, dim_per_head = v.shape
+
+    # Number of query, key, value blocks
     num_q = q_len // query_chunk_size
     num_kv = kv_len // key_chunk_size
+
+    # Reshape and transpose the dimension
     q = q.reshape((batch, num_q, query_chunk_size, num_heads, dim_per_head))
     k = k.reshape((batch, num_kv, key_chunk_size, num_heads, dim_per_head))
     v = v.reshape((batch, num_kv, key_chunk_size, num_heads, dim_per_head))
     q, k, v = map(lambda x: jnp.moveaxis(x, 1, 0), (q, k, v))
 
+    # Preparation for scan
     numerator, denominator, max_score = carry
     numerator = numerator.reshape((batch, num_q, query_chunk_size, num_heads, dim_per_head))
     numerator = jnp.moveaxis(numerator, 1, 0)
@@ -172,8 +209,13 @@ def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_star
         _chunk_attention_bias,
         query_chunk_size, key_chunk_size, bias, segment_ids, deterministic,
         attn_dropout, attn_pdrop, causal, dtype)
+
+    # scan with no carry (in both args/return)
+    # wonder why the authors do not use `map`
+    # instead
     def scan_attention(_, scan):
         q_chunk, numerator_chunk, denominator_chunk, max_score_chunk, q_chunk_idx = scan
+        
         @partial(jax.checkpoint, prevent_cse=prevent_cse, policy=policy)
         def scan_kv_block(carry, scan):
             k_chunk, value_chunk, k_chunk_idx = scan
@@ -182,6 +224,7 @@ def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_star
             bias_chunk = _chunk_bias_fn(q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx)
             attn_weights = attn_weights + bias_chunk
 
+            # update the maximum, denominator statistics
             max_score_chunk = jnp.maximum(prev_max_score_chunk, jnp.max(attn_weights, axis=-1))
             max_score_chunk = lax.stop_gradient(max_score_chunk)
             exp_weights = jnp.exp(attn_weights - max_score_chunk[..., None])
@@ -189,6 +232,7 @@ def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_star
             correction = rearrange(jnp.exp(prev_max_score_chunk - max_score_chunk), 'b h q -> b q h')[..., None]
             numerator_chunk = numerator_chunk * correction + exp_values
             denominator_chunk = denominator_chunk * jnp.exp(prev_max_score_chunk - max_score_chunk) + exp_weights.sum(axis=-1)
+            
             return (numerator_chunk, denominator_chunk, max_score_chunk), None
 
         def skip_upper_half(carry, args):
@@ -204,11 +248,14 @@ def _blockwise_attention_fwd(q, k, v, carry, q_chunk_idx_start, k_chunk_idx_star
                 args
             )
 
+        # compute (local) attention scores for k, v chunk for a fixed q chunk
         (numerator_chunk, denominator_chunk, max_score_chunk), _ = lax.scan(
             skip_upper_half, init=(numerator_chunk, denominator_chunk, max_score_chunk), xs=(k, v, jnp.arange(0, num_kv))
         )
         output_chunk = numerator_chunk / rearrange(denominator_chunk, 'b h q -> b q h')[..., None].astype(dtype)
         return (), (output_chunk, numerator_chunk, denominator_chunk, max_score_chunk)
+    
+    # compute (local) attention matrix for all q chunks
     _, (_, numerator, denominator, max_score) = lax.scan(scan_attention, init=(), xs=(q, numerator, denominator, max_score, jnp.arange(0, num_q)))
 
     numerator = jnp.moveaxis(numerator, 1, 0)
@@ -308,9 +355,11 @@ def _blockwise_attention_bwd(q, k, v, g, carry, q_chunk_idx_start, k_chunk_idx_s
 # Blockwise feedforward network for memory-efficient training
 def blockwise_ffn(remat_ffn, inputs, chunk_size, deterministic):
     inputs = rearrange(inputs, 'b (c n) d -> b c n d', c=chunk_size)
+    
     def scan_ffn(remat_ffn, carry, hidden_states):
         outputs = remat_ffn(hidden_states, deterministic=deterministic)
         return carry, outputs
+
     scan_axis = inputs.ndim - 2
     _, output = nn.scan(
         scan_ffn,
@@ -320,6 +369,7 @@ def blockwise_ffn(remat_ffn, inputs, chunk_size, deterministic):
         out_axes=scan_axis,
     )(remat_ffn, None, inputs)
     output = rearrange(output, 'b c n d -> b (c n) d')
+    
     return output
 
 
@@ -526,6 +576,7 @@ def _ring_flash_attention_bwd_tpu(axis_name, float32_logits, blockwise_kwargs, r
 
 @partial(jax.custom_vjp, nondiff_argnums=[5, 6, 7])
 def ring_flash_attention_tpu(q, k, v, attn_bias, segment_ids, axis_name, float32_logits, blockwise_kwargs):
+    '''Fused Attention'''
     y, _ = _ring_flash_attention_fwd_tpu(q, k, v, attn_bias, segment_ids, axis_name, float32_logits, blockwise_kwargs)
     return y
 

@@ -533,9 +533,19 @@ class FlaxLLaMAAttention(nn.Module):
         init_cache: bool = False,
         output_attentions: bool = False,
     ):
+        # compute query, key, value from input hidden states
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
+        # Set the sharding constraint for the query, key, value 
+        # 1st dim - dp & fsdp
+        # 2nd dim - sp
+        # 3rd dim - tp
+
         if xq.shape[1] == 1:
+            # Note. tux.with_sharding_constraint is a helper function from a module
+            # that the author of this paper created
+            # According to the author A smarter version of with_sharding_constraint that only applies the
+            # constraint if the current mesh contains the axes in the partition specs.
             xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), None, "tp"))
         else:
             xq = with_sharding_constraint(xq, PS(("dp", "fsdp"), "sp", "tp"))
@@ -698,15 +708,23 @@ class FlaxLLaMAMLP(nn.Module):
 
 
 class FlaxLLaMABlock(nn.Module):
+    """Attention Block that consists of (FlaxLLaMA) Attention & MLP module"""
     config: LLaMAConfig
     dtype: jnp.dtype=jnp.float32
     param_dtype: jnp.dtype=jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]]=None
 
+    # Note. setup is a Flax's way of explicitly defining module
+    #  - resembles how modules are defined in PyTorch
+    #  - Assign submodules / variables to `self.<attr>` inside a setup method
     def setup(self) -> None:
+        """ """
         attention_module = FlaxLLaMAAttention
         mlp_module = FlaxLLaMAMLP
         if self.config.remat_attention != '':
+            # Note. remat is a lifted version of `jax.checkpoint`
+            # trade off computation time and memory cost in the context of
+            # automatic differentiation (jax.grad, jax.vjp, jax.linearize)
             attention_module = remat(
                 FlaxLLaMAAttention, static_argnums=(4, 5, 6),
                 policy=get_gradient_checkpoint_policy(self.config.remat_attention),
@@ -725,18 +743,21 @@ class FlaxLLaMABlock(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
+
         self.feed_forward = mlp_module(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
+
         self.attention_norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
+        
         self.ffn_norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,

@@ -52,27 +52,63 @@ FLAGS, FLAGS_DEF = define_flags_with_default(
 
 
 def main(argv):
+    # JaxDistributedConfig.initialize 
+    # https://github.com/lhao499/tux/blob/02333b463d70315a15972fa5993a28c734a9cd9e/tux/distributed.py#L47
+    # Note that for config, Google's absl library has been used
+    #  - The last line `run(main)` will parse the program arguments like `--jax_distributed`
+    #  - --jax_distributed will hold values like initialize_jax_distributed = False
+    # coordinator_address / num_processes / process_id / local_device_ids
+    
+    # tldr; the it calls the below code
+    # jax.distributed.initialize(
+    #     coordinator_address=config.coordinator_address,
+    #     num_processes=config.num_processes,
+    #     process_id=config.process_id,
+    #     local_device_ids=local_device_ids,
+    # )
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
+
+    # Flags type to dict
     variant = tux.get_user_flags(FLAGS, FLAGS_DEF)
+    # Flags type to Config Dict type
     flags_config_dict = tux.user_flags_to_config_dict(FLAGS, FLAGS_DEF)
+    
+    # (wandb.init) spawns a new background process to log data to a run & 
+    # it also syncs data to wandb.ai by default, so you can see live visualizations.
     logger = tux.WandBLogger(
         config=FLAGS.logger,
         variant=variant,
         enable=FLAGS.log_all_worker or (jax.process_index() == 0),
     )
+
+    # set numpy, random, jax module seed
+    # For jax, it instantiates global jax_utils_rng object (type: tux.JaxRNG) 
+    #          which is a stateful object holding rng value of type jax.random.PRNGKey
     set_random_seed(FLAGS.seed)
 
+    
     if jax.process_index() == 0:
         output_dir = logger.output_dir
     else:
         output_dir = os.path.join(logger.output_dir, logger.experiment_id)
 
+    # Configuration Class for LLaMA
     config_cls = LLaMAConfig
+    # Model Class for LLaMA
     llama_cls = FlaxLLaMAForCausalLMModule
+
+    # LLaMAConfig.get_jax_mesh will turn mesh_dim string such as
+    # to jax.sharding.Mesh object
+    # with physical mesh & axis_names = ('dp', 'fsdp', 'tp', 'sp')
     mesh = config_cls.get_jax_mesh(FLAGS.mesh_dim)
 
+    # tokenizer: LLaMATokenizer (defined in llama.py) object
     tokenizer = config_cls.get_tokenizer(FLAGS.tokenizer)
+    
+    # dataset: 
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
+    
+    
     if FLAGS.autoresume and tux.check_exists(output_dir):
         logging.info('Found existing output. Resuming dataset from latest checkpoint...')
         resume_path = f"{output_dir}/dataset.pkl"
@@ -117,14 +153,16 @@ def main(argv):
         llama_config.update(dict(vocab_size=dataset.vocab_size))
     llama_config.update(dict(mesh_dim=FLAGS.mesh_dim))
 
+    # instantiate the LLama Model
     model = llama_cls(
         llama_config, dtype=get_float_dtype_by_name(FLAGS.dtype)
     )
 
+
     optimizer, optimizer_info = OptimizerFactory.get_optimizer(
-        FLAGS.optimizer,
-        get_mask(config_cls.get_weight_decay_exclusions()),
-        None,
+        FLAGS.optimizer, # config
+        get_mask(config_cls.get_weight_decay_exclusions()), # weight_decay_mask
+        None, # frozen param mask
     )
 
     def create_trainstate_from_params(params):
@@ -189,14 +227,24 @@ def main(argv):
             eval_acc=acc,
         )
 
+    # Compute the shape/dtype of fun without any FLOPs
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
+    
+    # train_state_partition will be a tuple that specifies
+    # which layer has what kind of partition spec
+    # e.g. (
+    #   ("transformer/wte/embedding", PS("tp", ("fsdp", "sp"))),
+    #   ("attention/(wq|wk|wv)/kernel", PS(None, ("fsdp", "sp"), "tp")),
+    # )
     train_state_partition = match_partition_rules(
-        config_cls.get_partition_rules(llama_config.scan_layers, llama_config.param_scan_axis), train_state_shapes
+        config_cls.get_partition_rules(llama_config.scan_layers, llama_config.param_scan_axis), 
+        train_state_shapes
     )
 
     shard_fns, gather_fns = make_shard_and_gather_fns(
         train_state_partition, train_state_shapes
     )
+    
     checkpointer = StreamingCheckpointer(
         FLAGS.checkpointer, logger.output_dir,
         enable=jax.process_index() == 0,
